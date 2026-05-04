@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping
 
 
 @dataclass(slots=True, frozen=True)
@@ -14,7 +13,6 @@ class MinecraftUser:
 
     def __post_init__(self) -> None:
         if not isinstance(self.username, str) or not self.username.strip():
-            
             raise ValueError("username is required")
         object.__setattr__(self, "username", self.username.strip())
         if isinstance(self.uuid, str):
@@ -23,7 +21,7 @@ class MinecraftUser:
 
     @property
     def avatar_url(self) -> str | None:
-        """Avatar URL from mc-heads when uuid is available."""
+        """Avatar URL from mc-heads when UUID is available."""
         if not self.uuid:
             return None
         return f"https://mc-heads.net/avatar/{self.uuid}"
@@ -93,6 +91,7 @@ class MinestratorAddonResult:
 
     @property
     def available(self) -> bool:
+        """True when the endpoint is available."""
         return self.api_code < 400
 
 
@@ -124,7 +123,7 @@ class MinestratorServerSummary:
 
 @dataclass(slots=True, frozen=True)
 class MinestratorLiveSnapshot:
-    """Typed snapshot from /server/<id>/live/light endpoint."""
+    """Typed snapshot from /server/<id>/live endpoint."""
 
     status: str | None
     state: str | None
@@ -151,12 +150,14 @@ class MinestratorLiveSnapshot:
 
 
 @dataclass(slots=True, frozen=True)
-class MinestratorChatMessage:
-    """Chat or system line normalized from websocket console output."""
+class MinestratorConsoleLine:
+    """Console or chat line parsed from the websocket stream."""
 
-    author: MinecraftUser
     content: str
     raw_line: str
     received_at: datetime
-    payload: Mapping[str, Any]
-    is_system: bool = False
+    author: MinecraftUser | None = None
+    is_chat: bool = False
+
+
+

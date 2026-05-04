@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any, Callable, Mapping, Sequence
+import re
+from datetime import datetime, timezone
+from typing import Any, Iterator, Mapping, Sequence
 
 import requests
 
 from ._http import HttpClient
-from ._utils import format_stats_timestamp, normalize_remote_path, parse_int
-from .errors import MinestratorApiError
-from .listeners import ChatListener, PresenceListener
+from ._utils import format_stats_timestamp, normalize_remote_path, parse_bool, parse_float, parse_int
+from .errors import MinestratorApiError, MinestratorDependencyError
 from .models import (
     MinecraftUser,
     MinestratorAddon,
     MinestratorAddonResult,
-    MinestratorChatMessage,
+    MinestratorConsoleLine,
     MinestratorFileEntry,
     MinestratorLiveSnapshot,
     MinestratorSftpCredentials,
@@ -22,23 +22,15 @@ from .models import (
     MinestratorWebsocketCredentials,
 )
 
-ChatCallback = Callable[[MinestratorChatMessage], None]
-UserCallback = Callable[[MinecraftUser], None]
-StatusCallback = Callable[[str | None, str | None], None]
-ErrorCallback = Callable[[Exception, str], None]
+_CONSOLE_EVENTS = {"console output", "console_output"}
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+_MC_COLOR_RE = re.compile("\u00A7.")
+_CONSOLE_PREFIX_RE = re.compile(r"^\[[^\]]+\]:\s*(?P<body>.*)$")
+_CHAT_LINE_RE = re.compile(r"(?:\[Not Secure\]\s*)?<(?P<author>[^>]+)>\s(?P<message>.+)")
 
 
 class Server:
     """Object-oriented API client bound to one Minestrator server id."""
-
-    _EVENT_NAMES = {
-        "on_chat_message",
-        "on_system_message",
-        "on_player_join",
-        "on_player_leave",
-        "on_status_update",
-        "on_listener_error",
-    }
 
     def __init__(
         self,
@@ -46,10 +38,22 @@ class Server:
         server_id: str | int,
         *,
         user_id: str | int | None = None,
-        websocket_origin: str | None,
         resolve_player_uuids: bool,
-        presence_poll_interval: float,
     ) -> None:
+        """Create a server client.
+
+        Args:
+            http_client (HttpClient): Shared HTTP client used by the library.
+            server_id (str | int): Server identifier.
+            user_id (str | int | None): Optional user identifier for websocket credentials.
+            resolve_player_uuids (bool): Resolve player UUIDs when fetching players.
+
+        Raises:
+            ValueError: If server_id is empty.
+
+        Returns:
+            None
+        """
         normalized_id = str(server_id).strip()
         if not normalized_id:
             raise ValueError("server_id is required")
@@ -57,52 +61,55 @@ class Server:
         self._http = http_client
         self._server_id = normalized_id
         self._user_id = str(user_id).strip() if user_id is not None else None
-        self._websocket_origin = websocket_origin.strip() if isinstance(websocket_origin, str) and websocket_origin.strip() else None
         self._resolve_player_uuids = bool(resolve_player_uuids)
-        self._presence_poll_interval = max(1.0, float(presence_poll_interval))
-
         self._minecraft_user_cache: dict[str, MinecraftUser] = {}
-        self._chat_listener: ChatListener | None = None
-        self._presence_listener: PresenceListener | None = None
-        self._last_status: str | None = None
-
-        self._event_handlers: dict[str, list[Callable[..., None]]] = {
-            "on_chat_message": [],
-            "on_system_message": [],
-            "on_player_join": [],
-            "on_player_leave": [],
-            "on_status_update": [],
-            "on_listener_error": [],
-        }
 
     @property
     def id(self) -> str:
+        """Server identifier."""
         return self._server_id
 
     @property
     def user_id(self) -> str | None:
+        """User identifier bound to this server client."""
         return self._user_id
 
     @property
-    def websocket_origin(self) -> str | None:
-        return self._websocket_origin
-
-    @property
     def resolve_player_uuids(self) -> bool:
+        """Whether player UUIDs are resolved by default."""
         return self._resolve_player_uuids
 
-    @property
-    def system_user(self) -> MinecraftUser:
-        return MinecraftUser(username="SYSTEM")
-
     def __enter__(self) -> Server:
+        """Enter context manager and return self.
+
+        Returns:
+            Server: This server instance.
+        """
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        """Exit context manager and close resources.
+
+        Args:
+            exc_type (type | None): Exception type, if any.
+            exc (BaseException | None): Exception instance, if any.
+            traceback (TracebackType | None): Traceback, if any.
+
+        Returns:
+            None
+        """
         self.close()
 
     def close(self) -> None:
-        self.stop_listeners()
+        """Close server client resources.
+
+        This is a no-op for the server instance, but kept for symmetry
+        with the top-level client.
+
+        Returns:
+            None
+        """
+        return
 
     def _route(self, suffix: str = "") -> str:
         normalized_suffix = suffix.lstrip("/")
@@ -118,6 +125,20 @@ class Server:
         params: Mapping[str, Any] | None = None,
         json_body: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Send a raw request scoped to the server.
+
+        Args:
+            method (str): HTTP method.
+            suffix (str): Route suffix after /server/{id}.
+            params (Mapping[str, Any] | None): Query parameters.
+            json_body (Mapping[str, Any] | None): JSON body.
+
+        Returns:
+            dict[str, Any]: Raw JSON payload.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         return self._http.request_raw(
             method,
             self._route(suffix),
@@ -134,6 +155,21 @@ class Server:
         json_body: Mapping[str, Any] | None = None,
         allow_api_error: bool = False,
     ) -> dict[str, Any]:
+        """Send a request and return the api section.
+
+        Args:
+            method (str): HTTP method.
+            suffix (str): Route suffix after /server/{id}.
+            params (Mapping[str, Any] | None): Query parameters.
+            json_body (Mapping[str, Any] | None): JSON body.
+            allow_api_error (bool): Allow non-success api codes.
+
+        Returns:
+            dict[str, Any]: api section of the response.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         return self._http.request_api(
             method,
             self._route(suffix),
@@ -151,6 +187,21 @@ class Server:
         json_body: Mapping[str, Any] | None = None,
         allow_api_error: bool = False,
     ) -> dict[str, Any]:
+        """Send a request and return the data section.
+
+        Args:
+            method (str): HTTP method.
+            suffix (str): Route suffix after /server/{id}.
+            params (Mapping[str, Any] | None): Query parameters.
+            json_body (Mapping[str, Any] | None): JSON body.
+            allow_api_error (bool): Allow non-success api codes.
+
+        Returns:
+            dict[str, Any]: data section of the response.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         return self._http.request_data(
             method,
             self._route(suffix),
@@ -201,6 +252,20 @@ class Server:
         resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> MinecraftUser:
+        """Build a MinecraftUser from a username.
+
+        Args:
+            username (str): Minecraft username.
+            resolve_uuid (bool | None): Resolve UUID when True. Defaults to client setting.
+            use_cache (bool): Use cached user data when available.
+
+        Returns:
+            MinecraftUser: Player identity object.
+
+        Raises:
+            ValueError: If username is empty.
+            MinestratorApiError: If Mojang API lookup fails.
+        """
         if not isinstance(username, str) or not username.strip():
             raise ValueError("username is required")
 
@@ -233,6 +298,18 @@ class Server:
         resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> MinestratorLiveSnapshot:
+        """Fetch current live server data.
+
+        Args:
+            resolve_uuid (bool | None): Resolve player UUIDs when True.
+            use_cache (bool): Use cached player data when available.
+
+        Returns:
+            MinestratorLiveSnapshot: Snapshot of live server status.
+
+        Raises:
+            MinestratorApiError: If the response payload is missing expected data.
+        """
         data = self.request_server_data("GET", "live")
 
         stats = data.get("stats")
@@ -257,15 +334,15 @@ class Server:
         disk_data = stats.get("disk") if isinstance(stats.get("disk"), dict) else {}
         memory_data = stats.get("memory") if isinstance(stats.get("memory"), dict) else {}
 
-        status_raw = data.get("status") # null : serveur operationel, "installing" : serveur en cours d'installation, "install_failed" : échec de l'installation, "suspended" : serveur suspendu
-        state = data.get("state") # "online" | "offline"
+        status_raw = data.get("status")
+        state_raw = data.get("state") # "online" | "offline"
         version_raw = stats.get("version")
         hostname_raw = stats.get("hostname")
 
         try:
             return MinestratorLiveSnapshot(
                 status=status_raw.strip() if isinstance(status_raw, str) and status_raw.strip() else None,
-                state=state.strip() if isinstance(state, str) and state.strip() else None,
+                state=state_raw.strip() if isinstance(state_raw, str) and state_raw.strip() else None,
                 version=version_raw.strip() if isinstance(version_raw, str) and version_raw.strip() else None,
                 hostname=hostname_raw.strip() if isinstance(hostname_raw, str) and hostname_raw.strip() else None,
                 cpu_current=parse_int(cpu_data.get("current"), 0), # type: ignore
@@ -292,34 +369,46 @@ class Server:
 
     @property
     def status(self) -> str | None:
+        """Current server status value.
+        Status can be null (operational), "installing", "install_failed", or "suspended".
+        """
         return self.get_live_snapshot().status
 
     @property
     def state(self) -> str | None:
+        """Current server state value.
+        State can be "online", or "offline".
+        """
         return self.get_live_snapshot().state
-    
+
     @property
     def version(self) -> str | None:
+        """Minecraft version installed on the server."""
         return self.get_live_snapshot().version
 
     @property
     def hostname(self) -> str | None:
+        """Server hostname or MOTD."""
         return self.get_live_snapshot().hostname
 
     @property
     def motd(self) -> str | None:
+        """Alias for hostname."""
         return self.hostname
 
     @property
     def players_online_count(self) -> int:
+        """Number of currently online players."""
         return self.get_live_snapshot().players_current
 
     @property
     def players_max_count(self) -> int:
+        """Maximum player slots."""
         return self.get_live_snapshot().players_limit
 
     @property
     def players_online(self) -> list[MinecraftUser]:
+        """List of currently online players"""
         return self.get_live_snapshot(resolve_uuid=self._resolve_player_uuids).players
 
     def get_online_players(
@@ -328,9 +417,33 @@ class Server:
         resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> list[MinecraftUser]:
+        """Return online players as MinecraftUser objects.
+
+        Args:
+            resolve_uuid (bool | None): Resolve UUIDs when True.
+            use_cache (bool): Use cached player data when available.
+
+        Returns:
+            list[MinecraftUser]: List of online players.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         return self.get_live_snapshot(resolve_uuid=resolve_uuid, use_cache=use_cache).players
 
     def is_player_online(self, player: str | MinecraftUser, *, case_sensitive: bool = False) -> bool:
+        """Check whether a player is currently online.
+
+        Args:
+            player (str | MinecraftUser): Player name or object.
+            case_sensitive (bool): Match case when True.
+
+        Returns:
+            bool: True if the player is online.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         username = player.username if isinstance(player, MinecraftUser) else str(player)
         if not username.strip():
             return False
@@ -346,10 +459,19 @@ class Server:
         return False
 
     def get_server_data(self) -> dict[str, Any]:
+        """Fetch the server metadata payload.
+
+        Returns:
+            dict[str, Any]: Server data payload.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         return self.request_server_data("GET", "")
 
     @property
     def server_name(self) -> str | None:
+        """Server display name."""
         server_data = self.get_server_data().get("server")
         if not isinstance(server_data, dict):
             return None
@@ -358,6 +480,7 @@ class Server:
 
     @property
     def dns(self) -> str | None:
+        """Server DNS value. (known as "server ip" by most minecraft users)"""
         server_data = self.get_server_data().get("server")
         if not isinstance(server_data, dict):
             return None
@@ -366,6 +489,7 @@ class Server:
 
     @property
     def server_ip(self) -> str | None:
+        """Server IP address."""
         server_data = self.get_server_data().get("server")
         if not isinstance(server_data, dict):
             return None
@@ -374,6 +498,7 @@ class Server:
 
     @property
     def server_port(self) -> int | None:
+        """Server game port."""
         server_data = self.get_server_data().get("server")
         if not isinstance(server_data, dict):
             return None
@@ -382,6 +507,14 @@ class Server:
         return parsed if parsed >= 0 else None
 
     def get_server_websocket_credentials(self) -> MinestratorWebsocketCredentials:
+        """Read websocket credentials from the server endpoint.
+
+        Returns:
+            MinestratorWebsocketCredentials: Websocket URL and token.
+
+        Raises:
+            MinestratorApiError: When credentials are missing.
+        """
         data = self.get_server_data()
         websocket_data = data.get("websocket")
         if not isinstance(websocket_data, dict):
@@ -405,6 +538,14 @@ class Server:
         return self._http.request_data("GET", f"/user/{resolved_user_id}/servers/websocket")
 
     def get_websocket_credentials(self) -> MinestratorWebsocketCredentials:
+        """Fetch best websocket credentials for this server.
+
+        Returns:
+            MinestratorWebsocketCredentials: Websocket URL and token.
+
+        Raises:
+            MinestratorApiError: When credentials are missing.
+        """
         if self._user_id:
             try:
                 user_ws_data = self._get_user_websocket_data(self._user_id)
@@ -429,7 +570,230 @@ class Server:
 
         return self.get_server_websocket_credentials()
 
+    def iter_console_lines(
+        self,
+        *,
+        send_logs: bool = False,
+        include_system: bool = True,
+        resolve_uuid: bool | None = None,
+        use_cache: bool = True,
+    ) -> Iterator[MinestratorConsoleLine]:
+        """Stream console lines from the server websocket.
+
+        Args:
+            send_logs (bool): Request historical logs before streaming new lines.
+            include_system (bool): Include non-chat console lines.
+            resolve_uuid (bool | None): Resolve player UUIDs when True.
+            use_cache (bool): Use cached player data when available.
+
+        Yields:
+            MinestratorConsoleLine: Parsed console or chat lines.
+
+        Returns:
+            Iterator[MinestratorConsoleLine]: Iterator over console lines.
+
+        Raises:
+            MinestratorDependencyError: If websocket-client is not installed.
+            MinestratorApiError: When websocket auth fails.
+        """
+        websocket_module = self._load_websocket_module()
+        credentials = self.get_websocket_credentials()
+        ws = websocket_module.create_connection(credentials.url, timeout=self._http.timeout)
+
+        try:
+            self._send_ws_auth(ws, credentials.token)
+            send_logs_pending = send_logs
+
+            while True:
+                raw_message = ws.recv()
+                if raw_message is None:
+                    break
+
+                payload = self._parse_ws_payload(raw_message)
+                if payload is None:
+                    continue
+
+                event_name = str(payload.get("event", "")).strip().lower()
+
+                if event_name.startswith("auth") and event_name != "auth success":
+                    raise MinestratorApiError(f"Websocket auth failed: {payload}")
+
+                if event_name == "auth success":
+                    if send_logs_pending:
+                        ws.send(json.dumps({"event": "send logs", "args": []}))
+                        send_logs_pending = False
+                    continue
+
+                if event_name in {"token expiring", "token expired"}:
+                    self._send_ws_auth(ws, None)
+                    continue
+
+                if event_name not in _CONSOLE_EVENTS:
+                    continue
+
+                for line in self._extract_console_lines(payload):
+                    parsed = self._parse_console_line(
+                        line,
+                        resolve_uuid=resolve_uuid,
+                        use_cache=use_cache,
+                    )
+                    if parsed is None:
+                        continue
+                    if not include_system and not parsed.is_chat:
+                        continue
+                    yield parsed
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def iter_chat_messages(
+        self,
+        *,
+        send_logs: bool = False,
+        resolve_uuid: bool | None = None,
+        use_cache: bool = True,
+    ) -> Iterator[MinestratorConsoleLine]:
+        """Stream chat messages from the server websocket.
+
+        Args:
+            send_logs (bool): Request historical logs before streaming new lines.
+            resolve_uuid (bool | None): Resolve player UUIDs when True.
+            use_cache (bool): Use cached player data when available.
+
+        Yields:
+            MinestratorConsoleLine: Parsed chat lines.
+
+        Returns:
+            Iterator[MinestratorConsoleLine]: Iterator over chat lines.
+
+        Raises:
+            MinestratorDependencyError: If websocket-client is not installed.
+            MinestratorApiError: When websocket auth fails.
+        """
+        for line in self.iter_console_lines(
+            send_logs=send_logs,
+            include_system=False,
+            resolve_uuid=resolve_uuid,
+            use_cache=use_cache,
+        ):
+            if line.is_chat:
+                yield line
+
+    @staticmethod
+    def _load_websocket_module() -> Any:
+        try:
+            import websocket  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise MinestratorDependencyError(
+                "Chat access requires websocket-client. Install with: pip install minestrator-api[realtime]"
+            ) from exc
+        return websocket
+
+    def _send_ws_auth(self, ws: Any, token: str | None) -> None:
+        if not token:
+            token = self.get_websocket_credentials().token
+        ws.send(json.dumps({"event": "auth", "args": [token]}))
+
+    @staticmethod
+    def _parse_ws_payload(raw_message: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_message, str):
+            try:
+                raw_message = raw_message.decode("utf-8")
+            except Exception:
+                return None
+        try:
+            payload = json.loads(raw_message)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    @staticmethod
+    def _extract_console_lines(payload: dict[str, Any]) -> list[str]:
+        args = payload.get("args")
+        chunks: list[str] = []
+
+        if isinstance(args, list):
+            for item in args:
+                if isinstance(item, str):
+                    chunks.append(item)
+                elif isinstance(item, dict):
+                    for key in ("line", "message", "output", "data"):
+                        value = item.get(key)
+                        if isinstance(value, str):
+                            chunks.append(value)
+
+        if not chunks:
+            data_value = payload.get("data")
+            if isinstance(data_value, str):
+                chunks.append(data_value)
+
+        lines: list[str] = []
+        for chunk in chunks:
+            for line in chunk.splitlines():
+                trimmed = line.strip()
+                if trimmed:
+                    lines.append(trimmed)
+        return lines
+
+    def _parse_console_line(
+        self,
+        raw_line: str,
+        *,
+        resolve_uuid: bool | None,
+        use_cache: bool,
+    ) -> MinestratorConsoleLine | None:
+        clean_line = _ANSI_ESCAPE_RE.sub("", raw_line)
+        clean_line = _MC_COLOR_RE.sub("", clean_line).strip()
+
+        prefix_match = _CONSOLE_PREFIX_RE.match(clean_line)
+        content = prefix_match.group("body").strip() if prefix_match else clean_line
+        if not content:
+            return None
+
+        match = _CHAT_LINE_RE.search(content)
+        if match:
+            author_name = match.group("author").strip()
+            message = match.group("message").strip()
+            if not author_name or not message:
+                return None
+
+            author = self.get_minecraft_user(
+                author_name,
+                resolve_uuid=resolve_uuid,
+                use_cache=use_cache,
+            )
+            return MinestratorConsoleLine(
+                content=message,
+                raw_line=raw_line,
+                received_at=datetime.now(timezone.utc),
+                author=author,
+                is_chat=True,
+            )
+
+        return MinestratorConsoleLine(
+            content=content,
+            raw_line=raw_line,
+            received_at=datetime.now(timezone.utc),
+            author=None,
+            is_chat=False,
+        )
+
     def get_sftp_credentials(self, *, required: bool = False) -> MinestratorSftpCredentials | None:
+        """Fetch SFTP credentials for the server.
+
+        Args:
+            required (bool): Raise when credentials are missing.
+
+        Returns:
+            MinestratorSftpCredentials | None: Credentials or None.
+
+        Raises:
+            MinestratorApiError: When required is True and credentials are missing.
+        """
         sftp_data = self.get_server_data().get("sftp")
         if not isinstance(sftp_data, dict):
             if required:
@@ -465,6 +829,17 @@ class Server:
         )
 
     def list_files(self, path: str = "") -> list[MinestratorFileEntry]:
+        """List files and folders for a path.
+
+        Args:
+            path (str): Remote path inside the server file system.
+
+        Returns:
+            list[MinestratorFileEntry]: File and folder entries.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         normalized_path = normalize_remote_path(path)
         suffix = "files/list/"
         if normalized_path:
@@ -502,6 +877,18 @@ class Server:
         return result
 
     def get_file_content(self, path: str) -> str:
+        """Fetch file content as text.
+
+        Args:
+            path (str): Remote file path.
+
+        Returns:
+            str: File content.
+
+        Raises:
+            ValueError: If path is empty.
+            MinestratorApiError: When the API returns an error payload.
+        """
         normalized_path = normalize_remote_path(path)
         if not normalized_path:
             raise ValueError("path is required")
@@ -513,6 +900,18 @@ class Server:
         return content
 
     def get_file_json(self, path: str) -> Any:
+        """Fetch file content and parse JSON.
+
+        Args:
+            path (str): Remote file path.
+
+        Returns:
+            Any: Parsed JSON content.
+
+        Raises:
+            ValueError: If path is empty.
+            MinestratorApiError: When the API returns invalid JSON.
+        """
         content = self.get_file_content(path)
         try:
             return json.loads(content)
@@ -520,6 +919,18 @@ class Server:
             raise MinestratorApiError(f"Invalid JSON in remote file: {path}") from exc
 
     def check_files_exist(self, file_paths: Sequence[str], *, prefer_post: bool = True) -> dict[str, bool]:
+        """Check existence for multiple file paths.
+
+        Args:
+            file_paths (Sequence[str]): Paths to check.
+            prefer_post (bool): Try POST before GET when True.
+
+        Returns:
+            dict[str, bool]: Map of path to existence flag.
+
+        Raises:
+            MinestratorApiError: When the API call fails.
+        """
         normalized_paths = [normalize_remote_path(path) for path in file_paths if str(path).strip()]
         normalized_paths = [path for path in normalized_paths if path]
         if not normalized_paths:
@@ -557,6 +968,17 @@ class Server:
         raise MinestratorApiError("Unable to parse files/exists response")
 
     def file_exists(self, path: str) -> bool:
+        """Check existence for a single file path.
+
+        Args:
+            path (str): Path to check.
+
+        Returns:
+            bool: True when the path exists.
+
+        Raises:
+            MinestratorApiError: When the API call fails.
+        """
         normalized = normalize_remote_path(path)
         if not normalized:
             return False
@@ -572,9 +994,25 @@ class Server:
         return False
 
     def get_properties_data(self) -> dict[str, Any]:
+        """Fetch raw server properties payload.
+
+        Returns:
+            dict[str, Any]: Raw properties data.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         return self.request_server_data("GET", "properties")
 
     def get_server_properties(self) -> dict[str, str]:
+        """Fetch server.properties as a key/value map.
+
+        Returns:
+            dict[str, str]: Properties map.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         properties_data = self.get_properties_data().get("properties")
         if not isinstance(properties_data, dict):
             return {}
@@ -586,6 +1024,15 @@ class Server:
         return parsed
 
     def get_property(self, key: str, default: str | None = None) -> str | None:
+        """Read a server.properties value.
+
+        Args:
+            key (str): Property name.
+            default (str | None): Default when missing.
+
+        Returns:
+            str | None: Property value or default.
+        """
         if not isinstance(key, str) or not key.strip():
             return default
         return self.get_server_properties().get(key.strip(), default)
@@ -617,14 +1064,43 @@ class Server:
         return MinestratorAddonResult(items=items, api_code=api_code, error=error)
 
     def get_plugins(self) -> MinestratorAddonResult:
+        """List plugins installed on the server.
+
+        Returns:
+            MinestratorAddonResult: Plugin entries and metadata.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         api_section = self.request_server_api("GET", "plugins", allow_api_error=True)
         return self._parse_addon_result(api_section, key="plugins")
 
     def get_mods(self) -> MinestratorAddonResult:
+        """List mods installed on the server.
+
+        Returns:
+            MinestratorAddonResult: Mod entries and metadata.
+
+        Raises:
+            MinestratorApiError: When the API returns an error payload.
+        """
         api_section = self.request_server_api("GET", "mods", allow_api_error=True)
         return self._parse_addon_result(api_section, key="mods")
 
     def get_stats(self, start: str | datetime, end: str | datetime) -> list[MinestratorStatPoint]:
+        """Fetch server stats for a time range.
+
+        Args:
+            start (str | datetime): Start timestamp.
+            end (str | datetime): End timestamp.
+
+        Returns:
+            list[MinestratorStatPoint]: Timeline points.
+
+        Raises:
+            ValueError: If start or end is empty.
+            MinestratorApiError: When the API returns an error payload.
+        """
         start_text = format_stats_timestamp(start)
         end_text = format_stats_timestamp(end)
         if not start_text or not end_text:
@@ -654,6 +1130,18 @@ class Server:
         return result
 
     def send_command(self, command: str) -> dict[str, Any]:
+        """Send a console command to the server.
+
+        Args:
+            command (str): Command text.
+
+        Returns:
+            dict[str, Any]: API response section.
+
+        Raises:
+            ValueError: If command is empty.
+            MinestratorApiError: When the API returns a non-success code.
+        """
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command is required")
 
@@ -667,254 +1155,3 @@ class Server:
             raise MinestratorApiError(f"Command failed with code {code}: {api_section}")
 
         return api_section
-
-    def event(self, callback: Callable[..., None]) -> Callable[..., None]:
-        """Register an event callback based on callback name."""
-        event_name = callback.__name__.strip().lower()
-        if event_name not in self._EVENT_NAMES:
-            names = ", ".join(sorted(self._EVENT_NAMES))
-            raise ValueError(f"Unknown event name '{callback.__name__}'. Expected one of: {names}")
-
-        self._register_event(event_name, callback)
-
-        if event_name in {"on_chat_message", "on_system_message"}:
-            self.start_chat_listener()
-        elif event_name in {"on_player_join", "on_player_leave", "on_status_update"}:
-            self.start_presence_listener()
-
-        return callback
-
-    def on_chat_message(
-        self,
-        *,
-        auto_start: bool = True,
-        daemon: bool = False,
-        reconnect: bool = True,
-        reconnect_delay: float = 3.0,
-        send_logs_on_auth: bool = False,
-    ) -> Callable[[ChatCallback], ChatCallback]:
-        def decorator(callback: ChatCallback) -> ChatCallback:
-            self._register_event("on_chat_message", callback)
-            if auto_start:
-                self.start_chat_listener(
-                    daemon=daemon,
-                    reconnect=reconnect,
-                    reconnect_delay=reconnect_delay,
-                    send_logs_on_auth=send_logs_on_auth,
-                )
-            return callback
-
-        return decorator
-
-    def on_system_message(
-        self,
-        *,
-        auto_start: bool = True,
-        daemon: bool = False,
-        reconnect: bool = True,
-        reconnect_delay: float = 3.0,
-        send_logs_on_auth: bool = False,
-    ) -> Callable[[ChatCallback], ChatCallback]:
-        def decorator(callback: ChatCallback) -> ChatCallback:
-            self._register_event("on_system_message", callback)
-            if auto_start:
-                self.start_chat_listener(
-                    daemon=daemon,
-                    reconnect=reconnect,
-                    reconnect_delay=reconnect_delay,
-                    send_logs_on_auth=send_logs_on_auth,
-                )
-            return callback
-
-        return decorator
-
-    def on_player_join(
-        self,
-        *,
-        auto_start: bool = True,
-        daemon: bool = False,
-        poll_interval: float | None = None,
-        resolve_uuid: bool | None = None,
-        use_cache: bool = True,
-        emit_initial: bool = False,
-    ) -> Callable[[UserCallback], UserCallback]:
-        def decorator(callback: UserCallback) -> UserCallback:
-            self._register_event("on_player_join", callback)
-            if auto_start:
-                self.start_presence_listener(
-                    daemon=daemon,
-                    poll_interval=poll_interval,
-                    resolve_uuid=resolve_uuid,
-                    use_cache=use_cache,
-                    emit_initial=emit_initial,
-                )
-            return callback
-
-        return decorator
-
-    def on_player_leave(
-        self,
-        *,
-        auto_start: bool = True,
-        daemon: bool = False,
-        poll_interval: float | None = None,
-        resolve_uuid: bool | None = None,
-        use_cache: bool = True,
-        emit_initial: bool = False,
-    ) -> Callable[[UserCallback], UserCallback]:
-        def decorator(callback: UserCallback) -> UserCallback:
-            self._register_event("on_player_leave", callback)
-            if auto_start:
-                self.start_presence_listener(
-                    daemon=daemon,
-                    poll_interval=poll_interval,
-                    resolve_uuid=resolve_uuid,
-                    use_cache=use_cache,
-                    emit_initial=emit_initial,
-                )
-            return callback
-
-        return decorator
-
-    def on_status_update(
-        self,
-        *,
-        auto_start: bool = True,
-        daemon: bool = False,
-        poll_interval: float | None = None,
-        resolve_uuid: bool | None = None,
-        use_cache: bool = True,
-        emit_initial: bool = False,
-    ) -> Callable[[StatusCallback], StatusCallback]:
-        def decorator(callback: StatusCallback) -> StatusCallback:
-            self._register_event("on_status_update", callback)
-            if auto_start:
-                self.start_presence_listener(
-                    daemon=daemon,
-                    poll_interval=poll_interval,
-                    resolve_uuid=resolve_uuid,
-                    use_cache=use_cache,
-                    emit_initial=emit_initial,
-                )
-            return callback
-
-        return decorator
-
-    def on_listener_error(self) -> Callable[[ErrorCallback], ErrorCallback]:
-        def decorator(callback: ErrorCallback) -> ErrorCallback:
-            self._register_event("on_listener_error", callback)
-            return callback
-
-        return decorator
-
-    def _register_event(self, event_name: str, callback: Callable[..., None]) -> None:
-        if event_name not in self._EVENT_NAMES:
-            raise ValueError(f"Unsupported event: {event_name}")
-
-        handlers = self._event_handlers[event_name]
-        if callback not in handlers:
-            handlers.append(callback)
-
-    def _dispatch(self, event_name: str, *args: Any) -> None:
-        callbacks = list(self._event_handlers.get(event_name, []))
-        for callback in callbacks:
-            try:
-                callback(*args)
-            except Exception as exc:
-                if event_name == "on_listener_error":
-                    continue
-                error_callbacks = list(self._event_handlers.get("on_listener_error", []))
-                for error_callback in error_callbacks:
-                    try:
-                        error_callback(exc, f"callback:{event_name}")
-                    except Exception:
-                        continue
-
-    def _handle_status_value(self, status: str | None) -> None:
-        normalized_status = status.strip() if isinstance(status, str) and status.strip() else None
-        previous_status = self._last_status
-        if normalized_status == previous_status:
-            return
-
-        self._last_status = normalized_status
-        self._dispatch("on_status_update", previous_status, normalized_status)
-
-    def start_chat_listener(
-        self,
-        *,
-        daemon: bool = False,
-        reconnect: bool = True,
-        reconnect_delay: float = 3.0,
-        send_logs_on_auth: bool = False,
-    ) -> None:
-        if self._chat_listener is None:
-            self._chat_listener = ChatListener(
-                self,
-                reconnect=reconnect,
-                reconnect_delay=reconnect_delay,
-                send_logs_on_auth=send_logs_on_auth,
-            )
-
-        if self._chat_listener.is_running:
-            return
-
-        self._chat_listener.start(daemon=daemon)
-
-    def start_presence_listener(
-        self,
-        *,
-        daemon: bool = False,
-        poll_interval: float | None = None,
-        resolve_uuid: bool | None = None,
-        use_cache: bool = True,
-        emit_initial: bool = False,
-    ) -> None:
-        effective_interval = self._presence_poll_interval if poll_interval is None else float(poll_interval)
-
-        if self._presence_listener is None:
-            self._presence_listener = PresenceListener(
-                self,
-                poll_interval=effective_interval,
-                resolve_uuid=resolve_uuid,
-                use_cache=use_cache,
-                emit_initial=emit_initial,
-            )
-        else:
-            self._presence_listener.update_settings(
-                poll_interval=effective_interval,
-                resolve_uuid=resolve_uuid,
-                use_cache=use_cache,
-                emit_initial=emit_initial,
-            )
-
-        if self._presence_listener.is_running:
-            return
-
-        self._presence_listener.start(daemon=daemon)
-
-    def stop_chat_listener(self) -> None:
-        if self._chat_listener is None:
-            return
-        if self._chat_listener.is_running:
-            self._chat_listener.stop()
-            self._chat_listener.join(timeout=5)
-
-    def stop_presence_listener(self) -> None:
-        if self._presence_listener is None:
-            return
-        if self._presence_listener.is_running:
-            self._presence_listener.stop()
-            self._presence_listener.join(timeout=5)
-
-    def stop_listeners(self) -> None:
-        self.stop_chat_listener()
-        self.stop_presence_listener()
-
-    def has_running_chat_listener(self) -> bool:
-        return self._chat_listener is not None and self._chat_listener.is_running
-
-    def has_running_presence_listener(self) -> bool:
-        return self._presence_listener is not None and self._presence_listener.is_running
-
-    def has_running_listeners(self) -> bool:
-        return self.has_running_chat_listener() or self.has_running_presence_listener()

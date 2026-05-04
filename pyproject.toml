@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minestrator-api"
-version = "0.1.1"
+version = "0.1.2"
 description = "Object-oriented Python client for the Minestrator API"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Redi_05" }]
-keywords = ["minecraft", "minestrator", "api", "websocket", "client", "python", "strator"]
+keywords = ["minecraft", "minestrator", "api", "client", "python", "strator"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
