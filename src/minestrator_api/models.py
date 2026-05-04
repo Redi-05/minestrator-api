@@ -127,13 +127,24 @@ class MinestratorLiveSnapshot:
     """Typed snapshot from /server/<id>/live/light endpoint."""
 
     status: str | None
+    state: str | None
     version: str | None
     hostname: str | None
+    cpu_current: int
     cpu_dedicated: int
     cpu_flexcore: int
     cpu_limit: int
+    cpu_percent: float
+    cpu_is_bursting: bool
+    memory_current_mb: int
     memory_limit_mb: int
+    memory_percent: float
+    disk_current_mb: int
     disk_limit_mb: int
+    disk_percent: float
+    network_received_bytes: int
+    network_transmitted_bytes: int
+    uptime_seconds: int
     players_current: int
     players_limit: int
     players: list[MinecraftUser]

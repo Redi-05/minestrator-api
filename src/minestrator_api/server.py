@@ -233,9 +233,12 @@ class Server:
         resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> MinestratorLiveSnapshot:
-        data = self.request_server_data("GET", "live/light")
+        data = self.request_server_data("GET", "live")
 
-        players_data = data.get("players") if isinstance(data.get("players"), dict) else {}
+        stats = data.get("stats")
+        if not isinstance(stats, dict):
+            raise MinestratorApiError('Missing "stats" object in live snapshot payload')
+        players_data = stats.get("players") if isinstance(stats.get("players"), dict) else {}
         raw_player_list = players_data.get("list") if isinstance(players_data, dict) else []
 
         player_names: list[str] = []
@@ -250,24 +253,36 @@ class Server:
             for name in player_names
         ]
 
-        cpu_data = data.get("cpu") if isinstance(data.get("cpu"), dict) else {}
-        disk_data = data.get("disk") if isinstance(data.get("disk"), dict) else {}
-        memory_data = data.get("memory") if isinstance(data.get("memory"), dict) else {}
+        cpu_data = stats.get("cpu") if isinstance(stats.get("cpu"), dict) else {}
+        disk_data = stats.get("disk") if isinstance(stats.get("disk"), dict) else {}
+        memory_data = stats.get("memory") if isinstance(stats.get("memory"), dict) else {}
 
-        status_raw = data.get("status")
-        version_raw = data.get("version")
-        hostname_raw = data.get("hostname")
+        status_raw = data.get("status") # null : serveur operationel, "installing" : serveur en cours d'installation, "install_failed" : échec de l'installation, "suspended" : serveur suspendu
+        state = data.get("state") # "online" | "offline"
+        version_raw = stats.get("version")
+        hostname_raw = stats.get("hostname")
 
         try:
             return MinestratorLiveSnapshot(
                 status=status_raw.strip() if isinstance(status_raw, str) and status_raw.strip() else None,
+                state=state.strip() if isinstance(state, str) and state.strip() else None,
                 version=version_raw.strip() if isinstance(version_raw, str) and version_raw.strip() else None,
                 hostname=hostname_raw.strip() if isinstance(hostname_raw, str) and hostname_raw.strip() else None,
+                cpu_current=parse_int(cpu_data.get("current"), 0), # type: ignore
                 cpu_dedicated=parse_int(cpu_data.get("dedicated"), 0), # type: ignore
                 cpu_flexcore=parse_int(cpu_data.get("flexcore"), 0), # type: ignore
                 cpu_limit=parse_int(cpu_data.get("limit"), 0), # type: ignore
+                cpu_percent=parse_float(cpu_data.get("percent"), 0.0), # type: ignore
+                cpu_is_bursting=parse_bool(cpu_data.get("is_bursting"), False), # type: ignore
+                memory_current_mb=parse_int(memory_data.get("current"), 0), # type: ignore
                 memory_limit_mb=parse_int(memory_data.get("limit"), 0), # type: ignore
+                memory_percent=parse_float(memory_data.get("percent"), 0.0), # type: ignore
+                disk_current_mb=parse_int(disk_data.get("current"), 0), # type: ignore
                 disk_limit_mb=parse_int(disk_data.get("limit"), 0), # type: ignore
+                disk_percent=parse_float(disk_data.get("percent"), 0.0), # type: ignore
+                network_received_bytes=parse_int(data.get("network", {}).get("received"), 0), # type: ignore
+                network_transmitted_bytes=parse_int(data.get("network", {}).get("transmitted"), 0), # type: ignore
+                uptime_seconds=parse_int(data.get("uptime"), 0), # type: ignore
                 players_current=parse_int(players_data.get("current"), 0), # type: ignore
                 players_limit=parse_int(players_data.get("limit"), 0), # type: ignore
                 players=players,
@@ -279,6 +294,10 @@ class Server:
     def status(self) -> str | None:
         return self.get_live_snapshot().status
 
+    @property
+    def state(self) -> str | None:
+        return self.get_live_snapshot().state
+    
     @property
     def version(self) -> str | None:
         return self.get_live_snapshot().version
