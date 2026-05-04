@@ -2,37 +2,48 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import requests
 
 
 @dataclass(slots=True, frozen=True)
 class MinecraftUser:
     """Minecraft player identity used across the library."""
-
     username: str
-    uuid: str | None = None
+    uuid: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.username, str) or not self.username.strip():
-            raise ValueError("username is required")
+        # Juste de la validation basique, pas d'appels réseau ici !
         object.__setattr__(self, "username", self.username.strip())
-        if isinstance(self.uuid, str):
-            cleaned_uuid = self.uuid.strip()
-            object.__setattr__(self, "uuid", cleaned_uuid or None)
+        object.__setattr__(self, "uuid", self.uuid.strip())
+
+    @classmethod
+    def create_from_username(cls, username: str) -> "MinecraftUser":
+        """Create a MinecraftUser from a username using the Mojang API."""
+        username = username.strip()
+        resp = requests.get(f"https://api.mojang.com/users/profiles/minecraft/{username}")
+        if resp.status_code == 200:
+            return cls(username=username, uuid=resp.json()["id"])
+        raise ValueError(f"Pseudo introuvable : {username}")
+
+    @classmethod
+    def create_from_uuid(cls, uuid: str) -> "MinecraftUser":
+        """Create a MinecraftUser from a UUID using the Mojang API."""
+        uuid = uuid.strip()
+        resp = requests.get(f"https://sessionserver.mojang.com/session/minecraft/profile/{uuid}")
+        if resp.status_code == 200:
+            return cls(username=resp.json()["name"], uuid=uuid)
+        raise ValueError(f"UUID introuvable : {uuid}")
 
     @property
-    def avatar_url(self) -> str | None:
-        """Avatar URL from mc-heads when UUID is available."""
-        if not self.uuid:
-            return None
+    def avatar_url(self) -> str:
         return f"https://mc-heads.net/avatar/{self.uuid}"
 
     @property
     def skin_url(self) -> str:
-        """Body render URL from mc-heads."""
         return f"https://mc-heads.net/body/{self.username}"
-
+    
     def __str__(self) -> str:
-        return self.username
+        return self.username or self.uuid or "UnknownPlayer"
 
 
 @dataclass(slots=True, frozen=True)

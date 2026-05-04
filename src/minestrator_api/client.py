@@ -21,7 +21,6 @@ class Client:
         base_url: str = "https://mine.sttr.io",
         timeout: float = 10.0,
         session: requests.Session | None = None,
-        resolve_player_uuids: bool = True,
     ) -> None:
         """Create a client for the Minestrator API.
 
@@ -31,7 +30,6 @@ class Client:
             base_url (str): Base URL for the API.
             timeout (float): HTTP timeout in seconds.
             session (requests.Session | None): Optional requests session.
-            resolve_player_uuids (bool): Resolve UUIDs by default for players.
 
         Raises:
             ValueError: If api_key is empty.
@@ -44,7 +42,6 @@ class Client:
             raise ValueError("api_key is required")
 
         self._user_id = str(user_id).strip() if user_id is not None else None
-        self._resolve_player_uuids = bool(resolve_player_uuids)
 
         self._http = HttpClient(
             api_key=cleaned_key,
@@ -123,7 +120,6 @@ class Client:
             self._http,
             normalized_id,
             user_id=self._user_id,
-            resolve_player_uuids=self._resolve_player_uuids,
         )
         self._servers[normalized_id] = server
         return server

@@ -38,7 +38,6 @@ class Server:
         server_id: str | int,
         *,
         user_id: str | int | None = None,
-        resolve_player_uuids: bool,
     ) -> None:
         """Create a server client.
 
@@ -46,7 +45,6 @@ class Server:
             http_client (HttpClient): Shared HTTP client used by the library.
             server_id (str | int): Server identifier.
             user_id (str | int | None): Optional user identifier for websocket credentials.
-            resolve_player_uuids (bool): Resolve player UUIDs when fetching players.
 
         Raises:
             ValueError: If server_id is empty.
@@ -61,7 +59,6 @@ class Server:
         self._http = http_client
         self._server_id = normalized_id
         self._user_id = str(user_id).strip() if user_id is not None else None
-        self._resolve_player_uuids = bool(resolve_player_uuids)
         self._minecraft_user_cache: dict[str, MinecraftUser] = {}
 
     @property
@@ -73,11 +70,6 @@ class Server:
     def user_id(self) -> str | None:
         """User identifier bound to this server client."""
         return self._user_id
-
-    @property
-    def resolve_player_uuids(self) -> bool:
-        """Whether player UUIDs are resolved by default."""
-        return self._resolve_player_uuids
 
     def __enter__(self) -> Server:
         """Enter context manager and return self.
@@ -210,57 +202,32 @@ class Server:
             allow_api_error=allow_api_error,
         )
 
-    def _resolve_minecraft_uuid(self, username: str) -> str | None:
-        url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
-
-        try:
-            response = requests.get(url, timeout=self._http.timeout)
-        except requests.RequestException as exc:
-            raise MinestratorApiError(
-                f"Network error while resolving Mojang UUID for {username}: {exc}"
-            ) from exc
-
-        if response.status_code in (204, 404):
-            return None
-
-        if response.status_code >= 400:
-            raise MinestratorApiError(
-                f"Mojang API error {response.status_code} while resolving UUID for {username}"
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise MinestratorApiError(
-                f"Invalid Mojang response while resolving UUID for {username}"
-            ) from exc
-
-        if not isinstance(payload, dict):
-            raise MinestratorApiError(
-                f"Unexpected Mojang payload type for {username}: {type(payload).__name__}"
-            )
-
-        uuid = payload.get("id")
-        if isinstance(uuid, str) and uuid.strip():
-            return uuid.strip()
-        return None
+    def _get_system_user(self) -> MinecraftUser:
+        cached = self._minecraft_user_cache.get("system")
+        if cached is not None:
+            return cached
+        user = MinecraftUser(username="SYSTEM", uuid="system")
+        self._minecraft_user_cache["system"] = user
+        return user
 
     def get_minecraft_user(
         self,
         username: str,
         *,
-        resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> MinecraftUser:
         """Build a MinecraftUser from a username.
 
         Args:
             username (str): Minecraft username.
-            resolve_uuid (bool | None): Resolve UUID when True. Defaults to client setting.
             use_cache (bool): Use cached user data when available.
 
         Returns:
             MinecraftUser: Player identity object.
+
+        Notes:
+            If the Mojang account does not exist, a fallback user is created
+            with UUID set to "0".
 
         Raises:
             ValueError: If username is empty.
@@ -270,22 +237,22 @@ class Server:
             raise ValueError("username is required")
 
         normalized_username = username.strip()
-        resolve = self._resolve_player_uuids if resolve_uuid is None else bool(resolve_uuid)
+        if normalized_username.lower() == "system":
+            return self._get_system_user()
         cache_key = normalized_username.lower()
 
         cached_user = self._minecraft_user_cache.get(cache_key)
         if use_cache and cached_user is not None:
-            if resolve and not cached_user.uuid:
-                resolved_user = MinecraftUser(
-                    username=cached_user.username,
-                    uuid=self._resolve_minecraft_uuid(cached_user.username),
-                )
-                self._minecraft_user_cache[cache_key] = resolved_user
-                return resolved_user
             return cached_user
 
-        uuid = self._resolve_minecraft_uuid(normalized_username) if resolve else None
-        user = MinecraftUser(username=normalized_username, uuid=uuid)
+        try:
+            user = MinecraftUser.create_from_username(normalized_username)
+        except ValueError:
+            user = MinecraftUser(username=normalized_username, uuid="0")
+        except requests.RequestException as exc:
+            raise MinestratorApiError(
+                f"Network error while resolving Mojang profile for {normalized_username}: {exc}"
+            ) from exc
 
         if use_cache:
             self._minecraft_user_cache[cache_key] = user
@@ -295,13 +262,11 @@ class Server:
     def get_live_snapshot(
         self,
         *,
-        resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> MinestratorLiveSnapshot:
         """Fetch current live server data.
 
         Args:
-            resolve_uuid (bool | None): Resolve player UUIDs when True.
             use_cache (bool): Use cached player data when available.
 
         Returns:
@@ -324,9 +289,8 @@ class Server:
                 if isinstance(item, str) and item.strip():
                     player_names.append(item.strip())
 
-        resolve = self._resolve_player_uuids if resolve_uuid is None else bool(resolve_uuid)
         players = [
-            self.get_minecraft_user(name, resolve_uuid=resolve, use_cache=use_cache)
+            self.get_minecraft_user(name, use_cache=use_cache)
             for name in player_names
         ]
 
@@ -409,18 +373,16 @@ class Server:
     @property
     def players_online(self) -> list[MinecraftUser]:
         """List of currently online players"""
-        return self.get_live_snapshot(resolve_uuid=self._resolve_player_uuids).players
+        return self.get_live_snapshot().players
 
     def get_online_players(
         self,
         *,
-        resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> list[MinecraftUser]:
         """Return online players as MinecraftUser objects.
 
         Args:
-            resolve_uuid (bool | None): Resolve UUIDs when True.
             use_cache (bool): Use cached player data when available.
 
         Returns:
@@ -429,7 +391,7 @@ class Server:
         Raises:
             MinestratorApiError: When the API returns an error payload.
         """
-        return self.get_live_snapshot(resolve_uuid=resolve_uuid, use_cache=use_cache).players
+        return self.get_live_snapshot(use_cache=use_cache).players
 
     def is_player_online(self, player: str | MinecraftUser, *, case_sensitive: bool = False) -> bool:
         """Check whether a player is currently online.
@@ -449,7 +411,7 @@ class Server:
             return False
         needle = username.strip()
 
-        for online_user in self.get_online_players(resolve_uuid=False, use_cache=True):
+        for online_user in self.get_online_players(use_cache=True):
             if case_sensitive:
                 if online_user.username == needle:
                     return True
@@ -575,7 +537,6 @@ class Server:
         *,
         send_logs: bool = False,
         include_system: bool = True,
-        resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> Iterator[MinestratorConsoleLine]:
         """Stream console lines from the server websocket.
@@ -583,7 +544,6 @@ class Server:
         Args:
             send_logs (bool): Request historical logs before streaming new lines.
             include_system (bool): Include non-chat console lines.
-            resolve_uuid (bool | None): Resolve player UUIDs when True.
             use_cache (bool): Use cached player data when available.
 
         Yields:
@@ -634,7 +594,6 @@ class Server:
                 for line in self._extract_console_lines(payload):
                     parsed = self._parse_console_line(
                         line,
-                        resolve_uuid=resolve_uuid,
                         use_cache=use_cache,
                     )
                     if parsed is None:
@@ -652,14 +611,12 @@ class Server:
         self,
         *,
         send_logs: bool = False,
-        resolve_uuid: bool | None = None,
         use_cache: bool = True,
     ) -> Iterator[MinestratorConsoleLine]:
         """Stream chat messages from the server websocket.
 
         Args:
             send_logs (bool): Request historical logs before streaming new lines.
-            resolve_uuid (bool | None): Resolve player UUIDs when True.
             use_cache (bool): Use cached player data when available.
 
         Yields:
@@ -675,7 +632,6 @@ class Server:
         for line in self.iter_console_lines(
             send_logs=send_logs,
             include_system=False,
-            resolve_uuid=resolve_uuid,
             use_cache=use_cache,
         ):
             if line.is_chat:
@@ -743,7 +699,6 @@ class Server:
         self,
         raw_line: str,
         *,
-        resolve_uuid: bool | None,
         use_cache: bool,
     ) -> MinestratorConsoleLine | None:
         clean_line = _ANSI_ESCAPE_RE.sub("", raw_line)
@@ -763,7 +718,6 @@ class Server:
 
             author = self.get_minecraft_user(
                 author_name,
-                resolve_uuid=resolve_uuid,
                 use_cache=use_cache,
             )
             return MinestratorConsoleLine(
@@ -778,7 +732,7 @@ class Server:
             content=content,
             raw_line=raw_line,
             received_at=datetime.now(timezone.utc),
-            author=None,
+            author=self._get_system_user(),
             is_chat=False,
         )
 
